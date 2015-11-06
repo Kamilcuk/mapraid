@@ -1,8 +1,6 @@
 MAKEFLAGS="-j 3"
 CC="gcc"
-ARCH=i585
-CFLAGS="-Wall -O2 -march=$(ARCH)"
-
+CFLAGS="-g"
 
 ALL: map-gen phrase-gen restore
 

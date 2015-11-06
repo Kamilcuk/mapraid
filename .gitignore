@@ -1,3 +1,10 @@
+# programs
+raid-map
+map-gen
+restore
+phrase-gen
+
+
 # Object files
 *.o
 *.ko
