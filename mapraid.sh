@@ -2,137 +2,212 @@
 set -euo pipefail
 
 VERSION="raidmap_v0.2.0"
+if ${DEBUG:=false}; then set -x; fi;
 
 # Functions ##########################
 
 usage() {
 	cat <<EOF
 Usage: 
-	$0 <mark|map> file [blocksize:=512]
+	$0 [OPTIONS] <mark|map> file [blocksize:=512]
+
+Options:
+	-h --help     - print this help and exit
+	-p            - print progressbar
+	-v --verbose  - increase verbose level
+	-i            - don't pring ignored blocks when mapping
 
 Written by Kamil Cukrowski.
 Licensed jointly under MIT License and Beerware License.
 EOF
+	if [ -n "${1:-}" ]; then
+		echo "ERROR:" "$@" >&2
+		exit 1
+	fi
 }
 
 progressbar() {
-	local -i val
-	max=40
-	val=$(($1*40/100))
-	echo ' [$(printf '#%.0s' $(seq $val))$(printf '#%.0s' $(seq $((max-val)))] (${1}%)'$'\r'
+	local -g PROGRESSBAR
+	if ! ${PROGRESSBAR:-false}; then return; fi
+	local -g -i PROGRESSBAR_LENMAX
+	local -i val max len notlen lenmax=${PROGRESSBAR_LENMAX:-40}
+	local pre post
+	val=$1
+	max=$2
+	len=$((lenmax*val/max))
+	notlen=$((lenmax-len))
+	if [ "$len" -eq 0 ]; then pre=""; else
+		pre=$(printf '#%.0s' $(seq $len))
+	fi
+	if [ "$notlen" -eq 0 ]; then post=""; else
+		post=$(printf ' %.0s' $(seq $notlen))
+	fi
+	echo -ne "[${pre}${post}] (${val}/${max})"$'\r'
+	if [ "$val" -eq "$max" ]; then echo; fi
 }
 
 assert() {
 	if ! "${@:1:$(($#-1))}"; then 
-		echo "Assertion failed in ${FUNCNAME[-1]}:" >&2
+		echo "Assertion '${@:1:$(($#-1))}' failed in ${FUNCNAME[-1]}:" >&2
 		echo " ${@:$#}" >&2;
 		exit 1;
 	fi
 }		
 
-debug() {
-	if ${DEBUG:-false}; then
-		echo "DBG: $@" >&2
+verbose() {
+	local -g VERBOSE_LVL
+	if [ "${VERBOSE_LVL:-0}" -gt "$1" ]; then
+		shift
+		echo "$@"
 	fi
-}	
-
-mark() {
-	local -g VERSION dev devsize devbs tmp bs
-	local -i cnt i strlen tmplen
-	local md5sum
-	exec 10>"$dev"
-	cnt=0
-	while [ "$cnt" -lt "$devbs" ]; do
-
-		echo -n "$VERSION $cnt " >"$tmp"
-		md5sum=$(md5sum "$tmp" | cut -d' ' -f1)
-		echo -n "$md5sum" >>"$tmp"
-		strlen=$(wc -c "$tmp" | cut -d' ' -f1)
-		assert [ "$strlen" -le "$bs" ] "block $cnt: strlen=$strlen -gt bs=$bs"
-		printf ' ' >>"$tmp"
-		printf '0%.0s' $(seq 3 $((bs-strlen))) >>"$tmp"
-		echo >>"$tmp"
-		tmplen=$(wc -c "$tmp" | cut -d' ' -f1)
-		assert [ "$tmplen" -eq "$bs" ] "block $cnt: Internal error - tmplen=$tmplen not equal bs"
-		debug "Write '$VERSION $cnt $md5sum' to file, length=$tmplen"
-		cat "$tmp" >&10
-
-		((++cnt))
-	done
-	exec 10>&-
 }
 
-readn() {
-	# read eaxactly $1 characters using read
-	local char
-	local -i num
+data_create() {
+	local -g VERSION BS
+	local -i outlen num md5sumlen=32
+	local out fill
 	num=$1
-	shift
-	while ((num--)); do
-		if ! LANG=C IFS= read "$@" -r -d '' -n 1 char; then
-			return 1
-		fi
-		echo -n "$char"
-	done
+	out=$2
+
+	str="$VERSION $num "
+	strlen=${#str}
+	((fill=strlen+md5sumlen+2))
+	assert [ "$BS" -gt "$fill" ] "blocksize=$BS is too small!"
+	((fill=BS-fill))
+	fill=$(seq "$fill")
+	{
+		echo -n "$str"
+		printf '0%.0s' $fill
+		echo -n ' '
+	} >"$out"
+	md5sum=$(md5sum "$out" | cut -d' ' -f1)
+	echo "$md5sum" >>"$out"
+
+	outlen=$(wc -c "$out" | cut -d' ' -f1)
+	assert [ "$outlen" -eq "$BS" ] "block $num: outlen=$outlen -gt BS=$BS"
+	
+	verbose 2 "Write '$VERSION $num <#${#fill} 0s> $md5sum' to file '$out', length=$outlen"
 }
 
-map() {
-	local -g VERSION dev devsize devbs tmp bs
-	local -i cnt readcnt
-	local str md5sum version readmd5sum rest
-	exec 10<"$dev"
+mode:mark() {
+	local -g DEV DEVBCNT BS
+	local -i cnt 
+	local temp
+
+	temp=$(mktemp)
+	trap 'echo "INTERNAL ERROR: last command returned $?."; rm "$temp";' EXIT
+	verbose 1 "temp=$temp"
+
+	verbose 0 "Starting marking '$DEV' with '$DEVBCNT' blocks"
+
+	for ((cnt = 0; cnt < DEVBCNT; ++cnt)); do
+		progressbar "$cnt" "$DEVBCNT"
+		data_create "$cnt" "$temp"
+		verbose 1 "Write block $cnt with '$(cut -d' ' -f1,2,4 $temp)'"
+		dd if="$temp" of="$DEV" seek="$cnt" bs="$BS" count=1 status=none
+	done
+
+	progressbar "$cnt" "$DEVBCNT"
+	rm "$temp"
+	trap '' EXIT
+	assert [ "$cnt" -eq "$DEVBCNT" ] "Internal error: cnt=$cnt != devbcnt=$DEVBCNT"
+
+	verbose 0 "Done"
+}
+
+ignoreprint() {
+	local -g IGNOREPRINT
+	if ! ${IGNOREPRINT:-true}; then return; fi
+	local cnt
+	cnt=$1
+	shift
+	echo "ignoring block $cnt:" "$@"
+}
+
+mode:map() {
+	local -g VERSION DEV DEVBCNT BS
+	local -i cnt ret ignored=0
+	local temp temp2
+	local readversion readcnt readfill readmd5sum
+
+	temp=$(mktemp)
+	temp2=$(mktemp)
+	trap 'echo "INTERNAL ERROR: last command returned $?."; rm "$temp" "$temp2";' EXIT
+	verbose 1 "temp=$temp temp2=$temp2"
+
+	verbose 0 "Starting mapping '$DEV' with '$DEVBCNT' blocks"
+
 	cnt=0
-	while line=$(readn $bs -u 10); do
-		read -r version readcnt readmd5sum rest <<<"$line"
+	while dd if="$DEV" of="$temp2" bs="$BS" skip="$cnt" count=1 status=none ; do
 
-		debug "$cnt Read: '$version $readcnt $readmd5sum $rest'"
-		if [ ! "$version" = "$VERSION" ]; then
-			echo "ignoring block $cnt: version is wrong: $version != $VERSION" >&2
-			echo "ignoring block $cnt: farbage in input" >&2
-			continue
-		fi
-		str="$version $readcnt $readmd5sum"
-		strlen=$(echo -n "$str" | wc -c)
-		str="$(printf '0%.0s' $(seq 3 $((bs-strlen))) )"	
-		if [ ! "$rest" = "$str" ]; then
-			echo "ignoring block $cnt: bad zeros on end of line $(echo "$rest"|wc -c) != $(echo "$str"|wc -c) -> rest=$rest" >&2
-			echo "Probably you specified bad blocksize." >&2
-			continue;
+		progressbar "$cnt" "$DEVBCNT"
+
+		tmp="$(wc -c "$temp2" | cut -d' ' -f1)"
+		if [ "$tmp" -eq 0 ]; then break; fi; # EOF
+		assert [ "$tmp" -eq "$BS" ] "Error - readed file is not blocksize=$BS bytes long"
+		if ! IFS=' ' read -r readversion readcnt readfill readmd5sum <"$temp2"; then 
+			ignoreprint "$cnt" "input is not parsable"
+			((++ignored)); ((++cnt)); continue;
 		fi
 
-		md5sum=$(echo -n "$version $readcnt " | md5sum - | cut -d' ' -f1)
-		assert [ "$md5sum" = "$readmd5sum" ] "block $cnt: md5sum is wrong: $md5sum != $readmd5sum"
+		verbose 2 "$cnt Read: '$readversion $readcnt $readfill $readmd5sum'"
+		if [ "$readversion" != "$VERSION" ]; then
+			ignoreprint "$cnt" "version is not valid: '$VERSION' != '$readversion'"
+			((++ignored)); ((++cnt)); continue;
+		fi
+
+		data_create "$readcnt" "$temp"
+		cmp -s "$temp" "$temp2" && ret=$? || ret=$?
+		if [ "$ret" -ne 0 ]; then
+			assert [ "$ret" -eq 1 ] "Comparing files '$temp' '$temp2' error"
+			ignoreprint "$cnt" "md5sum error"
+			((++ignored)); ((++cnt)); continue;
+		fi
+
 		echo "$cnt -> $readcnt"
 
 		((++cnt))
 	done
-	exec 10<&-
-	assert [ "$cnt" -eq "$devbs" ] "Read error: cnt=$cnt != devbs=$devbs. Read count error."
+
+	progressbar "$cnt" "$DEVBCNT"
+	rm "$temp" "$temp2"
+	trap '' EXIT
+	assert [ "$cnt" -eq "$DEVBCNT" ] "Internal read error: cnt=$cnt != devbcnt=$DEVBCNT"
+
+	verbose 0 "Done. IgnoredBlocksCnt=$ignored"
 }
 
 # Main ################################
 
-mode=${1:-}
-case "$mode" in
-mark|map) ;;
-*)
-	usage
-	echo "ERR: Unknown mode $mode" >&2
-	exit 1
-	;;
+OPTS=$(getopt -n "mapraid.sh" -o hpvi -l help,verbose -- "$@")
+eval set -- "$OPTS"
+while (($#)); do
+	case "$1" in
+		-h|--help) usage; exit 0; ;;
+		-p) : ${PROGRESSBAR:=true}; ;;
+		-v|--verbose) : ${VERBOSE_LVL:=0}; ((++VERBOSE_LVL)); ;;
+		-i) : ${IGNOREPRINT:=false}; ;;
+		--|*) shift; break; ;;
+	esac
+	shift
+done
+
+if [ $# -ne 3 ]; then usage "Wrong number of arguments: $#:" "$@"; fi;
+
+MODE=${1:-}
+case "$MODE" in
+	mark|map) ;;
+	*) usage "Unknown mode $mode"; ;;
 esac
 shift
-dev=$1
+DEV=$1
 shift
-bs=${1:-512}
+BS=${1:-512}
 
-devsize=$(wc -c "$dev" | cut -d' ' -f1)
-devbs=$((devsize/bs))
-assert [ $((devsize%bs)) -eq 0 ] "((devsize=$devsize%bs=$bs))=$((devsize%bs)) -gt 0"
+devsize=$(wc -c "$DEV" | cut -d' ' -f1)
+DEVBCNT=$((devsize/BS))
+assert [ $((devsize%BS)) -eq 0 ] "Size of '$DEV'=$devsize is not a multiplicity of blosize=$BS"
 
-tmp=$(mktemp)
-trap 'rm $tmp' EXIT
+verbose 1 "MODE=$MODE DEV=$DEV BS=$BS devsize=$devsize DEVBCNT=$DEVBCNT"
 
-debug "mode=$mode dev=$dev bs=$bs devsize=$devsize devbs=$devbs tmp=$tmp"
-
-$mode
+"mode:${MODE}"
